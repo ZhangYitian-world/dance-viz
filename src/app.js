@@ -1,12 +1,14 @@
 import {FPS,EDGES,clamp,formatTime,makeFrame,smoothFrames,frameIndex,poseAt,traceAt,clampLoop,alignToImage} from './core.js';
+import {JOINT_COLORS,screenReliable,regionCenter,viewportTransform,stepTime,screenTrace} from './observation.js';
 import {checkModelAssets} from './assets.js';
 import {SubjectTracker} from './subject.js';
 import {applyTemporalResult,enhanceSequence} from './temporal.js';
 const $=id=>document.getElementById(id), video=$('video');
 const state={frames:[],raw:[],url:null,busy:false,controller:null,view:null,a:null,b:null,loop:false,issueCount:0,focus:null,picking:false,model:null,base:[],temporal:[],depth:'base'};
-const options={mirror:false,skeleton:true,guides:true,hands:true,feet:true,trailLength:0.8,opacity:0.25,overlay:true,alignment:true};
+const options={mirror:false,skeleton:false,guides:true,hands:true,feet:true,trailLength:0.8,opacity:0.25,overlay:true,alignment:true,joints:[15,16,27,28]};
+const crop={zoom:1,region:'full',center:[.5,.5],drag:null};
 function notice(text,type=''){$('notice').textContent=text;$('notice').hidden=!text;$('notice').className=`notice ${type}`;}
-function controls(enabled){for(const id of ['play','timeline','set-a','set-b','loop'])$(id).disabled=!enabled;}
+function controls(enabled){for(const id of ['play','timeline','set-a','set-b','loop','step-back','step-forward'])$(id).disabled=!enabled;}
 function updateLoop(){const valid=clampLoop(state.a,state.b,video.duration);$('loop-times').textContent=valid?`${formatTime(state.a)} — ${formatTime(state.b)}`:'起点和终点须相隔至少 0.1 秒';if(!valid){$('loop').checked=false;state.loop=false;}}
 function waitVideoEvent(event,signal,timeout=10000){return new Promise((resolve,reject)=>{
   const cleanup=()=>{clearTimeout(timer);video.removeEventListener(event,ok);video.removeEventListener('error',fail);signal?.removeEventListener('abort',abort);};
@@ -18,7 +20,7 @@ async function seek(t,signal){if(Math.abs(video.currentTime-t)<0.0001&&video.rea
 async function loadVideo(file){
   if(state.busy)return;
   if(!file.type.startsWith('video/')&&!/\.(mp4|mov|webm)$/i.test(file.name)){notice('请选择 MP4、MOV 或 WebM 视频。','error');return;}
-  video.pause();controls(false);state.frames=[];state.raw=[];resetDepth();state.focus=null;state.picking=false;state.model=null;$('focus').disabled=true;$('focus').textContent='定位舞者';$('clear-focus').disabled=true;$('video-area').classList.remove('picking');state.a=null;state.b=null;state.loop=false;$('loop').checked=false;$('loop-times').textContent='尚未设置';state.view&&(state.view.root.visible=false);$('pose-state').textContent='等待分析';$('stage-empty').hidden=false;$('analyze').disabled=true;$('replace').disabled=true;$('analyze').textContent='分析动作 ↗';drawQuality();
+  video.pause();resetCrop();controls(false);state.frames=[];state.raw=[];resetDepth();state.focus=null;state.picking=false;state.model=null;$('focus').disabled=true;$('focus').textContent='定位舞者';$('clear-focus').disabled=true;$('video-area').classList.remove('picking');state.a=null;state.b=null;state.loop=false;$('loop').checked=false;$('loop-times').textContent='尚未设置';state.view&&(state.view.root.visible=false);$('pose-state').textContent='等待分析';$('stage-empty').hidden=false;$('analyze').disabled=true;$('replace').disabled=true;$('analyze').textContent='分析动作 ↗';drawQuality();
   if(state.url)URL.revokeObjectURL(state.url);state.url=URL.createObjectURL(file);
   try{const ready=waitVideoEvent('loadedmetadata');video.src=state.url;video.load();await ready;
     if(!Number.isFinite(video.duration)||video.duration<=0)throw new Error('无法读取有效视频时长，请换一个文件。');
@@ -26,7 +28,7 @@ async function loadVideo(file){
     $('clip-name').textContent=file.name;$('video-meta').textContent=`${video.videoWidth} × ${video.videoHeight} · ${video.duration.toFixed(1)} 秒`;
     $('timeline').max=video.duration;$('timeline').value=0;$('upload-card').hidden=true;$('analyze').disabled=false;$('replace').disabled=false;$('focus').disabled=false;controls(true);
     $('source-badge').textContent='已载入 · 尚未分析';$('time').textContent=`${formatTime(0)} / ${formatTime(video.duration)}`;
-    notice('点击「分析动作」开始。');drawQuality();
+    notice('可直接慢放与放大，分析后显示轨迹。');drawQuality();
   }catch(e){video.removeAttribute('src');video.load();URL.revokeObjectURL(state.url);state.url=null;$('upload-card').hidden=false;$('clip-name').textContent='导入你的舞段';$('video-meta').textContent='保留动作与音乐';$('source-badge').textContent='最长 90 秒';notice(e.message,'error');}
 }
 let visionModule = null;
@@ -41,9 +43,8 @@ async function model(variant,numPoses){
 }
 async function analyze(){
   if(state.busy||!state.url)return;
-  if(!state.view){notice('三维显示尚未就绪。请先下载依赖，或确认浏览器支持 WebGL。','error');return;}
   video.pause();state.picking=false;$('video-area').classList.remove('picking');state.busy=true;state.controller=new AbortController();const signal=state.controller.signal,variant=$('model').value,tracker=new SubjectTracker(state.focus);controls(false);$('analyze').disabled=true;$('replace').disabled=true;$('choose').disabled=true;$('model').disabled=true;$('focus').disabled=true;$('clear-focus').disabled=true;
-  $('analysis-panel').hidden=false;$('progress').value=0;$('analysis-text').textContent='加载本地姿态模型…';notice('');state.frames=[];state.raw=[];resetDepth();state.view.root.visible=false;drawQuality();
+  $('analysis-panel').hidden=false;$('progress').value=0;$('analysis-text').textContent='加载本地姿态模型…';notice('');state.frames=[];state.raw=[];resetDepth();if(state.view)state.view.root.visible=false;drawQuality();
   let landmarker;
   try{
     landmarker=await model(variant,state.focus?3:1);if(signal.aborted)throw new DOMException('已取消','AbortError');
@@ -91,14 +92,22 @@ function drawOverlay(t){
   const point=p=>[(options.mirror?1-p[0]:p[0])*w+x,p[1]*h+y];
   if(state.focus&&t<0.1){const [px,py]=point(state.focus);ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(px,py,9,0,Math.PI*2);ctx.moveTo(px-13,py);ctx.lineTo(px+13,py);ctx.moveTo(px,py-13);ctx.lineTo(px,py+13);ctx.stroke();}
   if(!options.overlay||!state.frames.length||state.busy)return;
-  const i=frameIndex(t,state.frames),f=poseAt(t,state.frames);if(!f?.screen)return;
+  const frames=state.base.length?state.base:state.frames,f=poseAt(t,frames);if(!f?.screen)return;
   ctx.lineWidth=1.5;ctx.strokeStyle=f.issue?'#e3a44d':'#8ae4be';ctx.lineCap='round';
-  for(const [a,b]of EDGES){if(f.screen[a][2]<0.55||f.screen[b][2]<0.55)continue;ctx.beginPath();ctx.moveTo(...point(f.screen[a]));ctx.lineTo(...point(f.screen[b]));ctx.stroke();}
-  for(const joint of [11,12,13,14,15,16,23,24,25,26,27,28]){if(f.screen[joint][2]<0.55)continue;ctx.fillStyle=[15,16].includes(joint)?'#ff9b65':[27,28].includes(joint)?'#78bfff':'#8ae4be';ctx.strokeStyle='#203b32';ctx.lineWidth=1;ctx.beginPath();ctx.arc(...point(f.screen[joint]),[15,16,27,28].includes(joint)?3.5:2.2,0,Math.PI*2);ctx.fill();ctx.stroke();}
-  for(const [joint,enabled,color]of [[15,options.hands,'#f3ad8b'],[16,options.hands,'#f3ad8b'],[27,options.feet,'#8dbbe9'],[28,options.feet,'#8dbbe9']]){
-    if(!enabled)continue;ctx.strokeStyle=color;ctx.beginPath();let started=false;
-    const indices=[];for(let j=i;j>=0&&state.frames[j].t>=t-options.trailLength;j--){const f=state.frames[j],p=f.screen?.[joint];if(!p||p[2]<.55||p[0]<0||p[0]>1||p[1]<0||p[1]>1||f.unstable)break;indices.unshift(j);}
-    for(const j of indices){const p=state.frames[j].screen[joint];if(p[2]<0.55){started=false;continue;}if(!started){ctx.moveTo(...point(p));started=true;}else ctx.lineTo(...point(p));}ctx.stroke();
+  if(options.skeleton)for(const [a,b]of EDGES){if(f.screen[a][2]<0.55||f.screen[b][2]<0.55)continue;ctx.beginPath();ctx.moveTo(...point(f.screen[a]));ctx.lineTo(...point(f.screen[b]));ctx.stroke();}
+  for(const joint of [11,12,13,14,15,16,23,24,25,26,27,28]){if(f.screen[joint][2]<0.55)continue;if(JOINT_COLORS[joint]&&!options.joints.includes(joint))continue;if(!JOINT_COLORS[joint]&&!options.skeleton)continue;ctx.fillStyle=JOINT_COLORS[joint]||'#8ae4be';ctx.strokeStyle='#203b32';ctx.lineWidth=1;ctx.beginPath();ctx.arc(...point(f.screen[joint]),[15,16,27,28].includes(joint)?3.5:2.2,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  if(options.guides){
+    for(const [a,b,color]of [[11,12,'#ffc176'],[23,24,'#99caff']]){
+      if(!screenReliable(f.screen[a])||!screenReliable(f.screen[b]))continue;
+      ctx.lineWidth=3;ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(...point(f.screen[a]));ctx.lineTo(...point(f.screen[b]));ctx.stroke();
+      ctx.font='11px sans-serif';ctx.fillStyle=color;ctx.fillText(a===11?'肩':'胯',...point(f.screen[a]));
+    }
+  }
+  for(const joint of options.joints){
+    ctx.strokeStyle=JOINT_COLORS[joint];ctx.lineWidth=2;ctx.beginPath();
+    const path=screenTrace(t,frames,joint,options.trailLength);
+    path.forEach((p,i)=>i?ctx.lineTo(...point(p)):ctx.moveTo(...point(p)));ctx.stroke();
+    const current=f.screen[joint];if(path.length&&screenReliable(current)){ctx.beginPath();ctx.moveTo(...point(path.at(-1)));ctx.lineTo(...point(current));ctx.stroke();}
   }
 }
 function tick(){
@@ -107,9 +116,9 @@ function tick(){
     if(loop&&!video.paused&&(t>=loop[1]||t<loop[0])){video.currentTime=loop[0];t=loop[0];}
     $('timeline').value=t;$('time').textContent=`${formatTime(t)} / ${formatTime(video.duration)}`;$('play').textContent=video.paused?'▶':'Ⅱ';$('play').setAttribute('aria-label',video.paused?'播放':'暂停');
     const observed=poseAt(t,state.frames),pose=options.alignment?alignToImage(observed,video.videoWidth/video.videoHeight):observed;
-    state.view?.update(pose,t,state.frames,{...options,aspect:video.videoWidth/video.videoHeight});drawOverlay(t);
+    state.view?.update(pose,t,state.frames,{...options,aspect:video.videoWidth/video.videoHeight});drawOverlay(t);updateCrop(t);
     if(state.frames.length&&!state.picking){$('pose-state').textContent=!pose?.points?'未检测到舞者':pose.unstable?'姿态暂不可用':pose.issue?'局部关节缺失':'可旋转观察';}
-  }state.view?.draw();requestAnimationFrame(tick);
+  }if(!$('reconstruction').hidden)state.view?.draw();requestAnimationFrame(tick);
 }
 $('choose').onclick=()=>{if(!state.busy)$('file').click();};$('replace').onclick=$('choose').onclick;
 $('file').onchange=e=>{const file=e.target.files[0];e.target.value='';if(file)loadVideo(file);};
@@ -117,7 +126,7 @@ for(const event of ['dragenter','dragover'])$('video-area').addEventListener(eve
 for(const event of ['dragleave','drop'])$('video-area').addEventListener(event,e=>{e.preventDefault();$('upload-card').classList.remove('dragging');});$('video-area').addEventListener('drop',e=>{if(e.dataTransfer.files[0])loadVideo(e.dataTransfer.files[0]);});
 $('analyze').onclick=analyze;$('cancel').onclick=()=>state.controller?.abort();
 function clearAnalysis(){state.frames=[];state.raw=[];resetDepth();state.model=null;state.view&&(state.view.root.visible=false);$('stage-empty').hidden=false;$('pose-state').textContent='等待分析';$('source-badge').textContent='已载入 · 请重新分析';$('analyze').textContent='分析动作 ↗';drawQuality();}
-$('focus').onclick=async()=>{if(state.busy||!state.url)return;video.pause();await seek(0);state.picking=!state.picking;$('video-area').classList.toggle('picking',state.picking);$('focus').textContent=state.picking?'取消定位':state.focus?'重新定位':'定位舞者';notice(state.picking?'点击舞者胸腹位置，避开倒影。':'已取消定位。');};
+$('focus').onclick=async()=>{if(state.busy||!state.url)return;video.pause();resetCrop();await seek(0);state.picking=!state.picking;$('video-area').classList.toggle('picking',state.picking);$('focus').textContent=state.picking?'取消定位':state.focus?'重新定位':'定位舞者';notice(state.picking?'点击舞者胸腹位置，避开倒影。':'已取消定位。');};
 $('video-area').addEventListener('pointerdown',event=>{if(!state.picking||state.busy)return;const rect=$('overlay').getBoundingClientRect(),scale=Math.min(rect.width/video.videoWidth,rect.height/video.videoHeight),w=video.videoWidth*scale,h=video.videoHeight*scale;let x=(event.clientX-rect.left-(rect.width-w)/2)/w,y=(event.clientY-rect.top-(rect.height-h)/2)/h;if(x<0||x>1||y<0||y>1)return;if(options.mirror)x=1-x;state.focus=[x,y];state.picking=false;$('video-area').classList.remove('picking');$('focus').textContent='重新定位';$('clear-focus').disabled=false;clearAnalysis();notice('舞者已定位，请重新分析。');});
 $('clear-focus').onclick=()=>{state.focus=null;state.picking=false;$('video-area').classList.remove('picking');$('focus').textContent='定位舞者';$('clear-focus').disabled=true;clearAnalysis();notice('已恢复自动选择，请重新分析。');};
 $('model').onchange=()=>notice(`已选择 ${$('model').value==='heavy'?'Heavy':'Full'}。点击「${state.frames.length?'重新分析':'分析动作'}」应用。`);
@@ -127,11 +136,38 @@ $('timeline').oninput=e=>{if(!state.busy)video.currentTime=+e.target.value;};
 document.querySelectorAll('[data-speed]').forEach(button=>button.onclick=()=>{video.playbackRate=+button.dataset.speed;document.querySelectorAll('[data-speed]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));});
 document.querySelectorAll('[data-view]').forEach(button=>button.onclick=()=>{state.view?.view(button.dataset.view);document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));});
 $('set-a').onclick=()=>{state.a=video.currentTime;updateLoop();};$('set-b').onclick=()=>{state.b=video.currentTime;updateLoop();};$('loop').onchange=e=>{updateLoop();state.loop=e.target.checked&&Boolean(clampLoop(state.a,state.b,video.duration));};
-for(const [id,key]of [['hand-trails','hands'],['foot-trails','feet'],['body-guides','guides'],['skeleton','skeleton'],['show-overlay','overlay'],['mirror','mirror'],['image-alignment','alignment']])$(id).onchange=e=>{options[key]=e.target.checked;if(key==='mirror')video.style.transform=options.mirror?'scaleX(-1)':'';};
+for(const [id,key]of [['body-guides','guides'],['skeleton','skeleton'],['show-overlay','overlay'],['mirror','mirror'],['image-alignment','alignment']])$(id).onchange=e=>{options[key]=e.target.checked;if(key==='mirror')video.style.transform=options.mirror?'scaleX(-1)':'';};
 $('sound').onchange=e=>{video.muted=!e.target.checked;};
 $('trail-length').oninput=e=>{options.trailLength=+e.target.value;$('trail-value').textContent=`${options.trailLength.toFixed(1)} 秒`;};$('opacity').oninput=e=>{options.opacity=+e.target.value;$('opacity-value').textContent=`${Math.round(options.opacity*100)}%`;};
-document.addEventListener('keydown',e=>{if(e.code==='Space'&&!['INPUT','BUTTON','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('play').disabled){e.preventDefault();$('play').click();}});
+document.addEventListener('keydown',e=>{if(!['INPUT','BUTTON','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('play').disabled&&['ArrowLeft','ArrowRight'].includes(e.code)){e.preventDefault();step(e.code==='ArrowRight'?1:-1);}if(e.code==='Space'&&!['INPUT','BUTTON','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('play').disabled){e.preventDefault();$('play').click();}});
 window.addEventListener('resize',drawQuality);window.addEventListener('beforeunload',()=>{if(state.url)URL.revokeObjectURL(state.url);});
 window.addEventListener('themechange',event=>state.view?.setTheme(event.detail.theme));
-try{const {MotionView}=await import('./renderer.js');state.view=new MotionView($('stage'),()=>document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed','false')));}catch(e){notice('三维显示未能加载。首次运行请先执行 python3 scripts/download_assets.py，再刷新页面；浏览器须支持 WebGL。','error');console.error(e);}
+async function toggleThree(){
+  const open=$('reconstruction').hidden;
+  $('reconstruction').hidden=!open;$('viewers').classList.toggle('with-3d',open);$('toggle-3d').setAttribute('aria-pressed',String(open));$('toggle-3d').textContent=open?'收起三维参考':'打开三维参考';
+  document.querySelectorAll('.three-setting').forEach(el=>el.hidden=!open);
+  if(open&&!state.view){try{const {MotionView}=await import('./renderer.js');state.view=new MotionView($('stage'),()=>document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed','false')));}catch(e){notice('三维参考暂时无法打开，仍可使用视频观察功能。','error');console.error(e);}}
+  state.view?.resize();
+}
+$('toggle-3d').onclick=toggleThree;
+for(const joint of [15,16,27,28])$(`trail-${joint}`).onchange=()=>{options.joints=[15,16,27,28].filter(j=>$(`trail-${j}`).checked);};
+async function step(direction){if(state.busy||!state.url)return;video.pause();await seek(stepTime(video.currentTime,direction,video.duration,FPS)).catch(e=>notice(e.message,'error'));}
+$('step-back').onclick=()=>step(-1);$('step-forward').onclick=()=>step(1);
+function resetCrop(){crop.zoom=1;crop.region='full';crop.center=[.5,.5];crop.drag=null;$('zoom').value=1;$('zoom-value').textContent='1.0×';$('region').value='full';$('video-layer').style.transform='';$('video-area').classList.remove('zoomed');$('crop-state').textContent='放大后可拖动画面';}
+function updateCrop(t){
+  if(crop.region!=='full'){
+    const pose=poseAt(t,state.base.length?state.base:state.frames),center=regionCenter(pose?.screen,crop.region);
+    // If the joint disappears, retain the last crop rather than guessing its location.
+    if(center)crop.center=center;
+    $('crop-state').textContent=center?'正在跟随 · 拖动可手动调整':state.frames.length?'暂未检测到该部位 · 可拖动调整':'先分析可跟随部位 · 也可拖动调整';
+  }else $('crop-state').textContent=crop.zoom>1?'拖动画面调整观察位置':'放大后可拖动画面';
+  const area=$('video-area'),v=viewportTransform(area.clientWidth,area.clientHeight,video.videoWidth,video.videoHeight,crop.zoom,crop.center,options.mirror);
+  $('video-layer').style.transform=`translate(${v.x}px,${v.y}px) scale(${v.zoom})`;area.classList.toggle('zoomed',crop.zoom>1&&!state.picking);
+}
+$('zoom').oninput=e=>{crop.zoom=+e.target.value;$('zoom-value').textContent=`${crop.zoom.toFixed(1)}×`;};
+$('region').onchange=e=>{crop.region=e.target.value;crop.center=[.5,.5];crop.zoom=crop.region==='full'?1:2.5;$('zoom').value=crop.zoom;$('zoom-value').textContent=`${crop.zoom.toFixed(1)}×`;};
+$('reset-zoom').onclick=resetCrop;
+$('video-area').addEventListener('pointerdown',e=>{if(state.picking||state.busy||crop.zoom<=1||!state.url)return;crop.drag={x:e.clientX,y:e.clientY,center:[...crop.center],id:e.pointerId};$('video-area').setPointerCapture(e.pointerId);});
+$('video-area').addEventListener('pointermove',e=>{if(!crop.drag||e.pointerId!==crop.drag.id)return;const area=$('video-area'),scale=Math.min(area.clientWidth/video.videoWidth,area.clientHeight/video.videoHeight);crop.region='full';$('region').value='full';crop.center=[clamp(crop.drag.center[0]-(e.clientX-crop.drag.x)/(video.videoWidth*scale*crop.zoom)*(options.mirror?-1:1),0,1),clamp(crop.drag.center[1]-(e.clientY-crop.drag.y)/(video.videoHeight*scale*crop.zoom),0,1)];});
+for(const event of ['pointerup','pointercancel','lostpointercapture'])$('video-area').addEventListener(event,()=>crop.drag=null);
 tick();
